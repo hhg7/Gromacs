@@ -5,6 +5,7 @@ use DDP { output => 'STDOUT', array_max => 10, show_memsize => 1 };
 use Devel::Confess 'color';
 package Gromacs; # packages after this are used, but aren't available when the module is loaded
 our $VERSION = 0.01;
+use File::Temp 'tempfile';
 use List::MoreUtils 'first_index';
 use DDP { output => 'STDOUT', array_max => 10, show_memsize => 1 };
 use Devel::Confess 'color';
