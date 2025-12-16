@@ -12,7 +12,7 @@ use Devel::Confess 'color';
 use Cwd 'getcwd';
 use Exporter qw(import);
 #use Term::ANSIColor;
-our @EXPORT = qw(gromacs_log2hash plot_gromacs_energy make_rmsd_json);
+our @EXPORT = qw(gromacs_log2hash plot_gromacs_energy make_rmsd_json get_group_indices);
 our @EXPORT_OK = @EXPORT;
 use JSON 'encode_json';
 use Matplotlib::Simple;
@@ -266,5 +266,46 @@ else:# 3. Reshape the 1D array into the N x N matrix
 		'input.files'  => [$py->filename],
 		'output.files' => [$rmsdjson],
 	});
+}
+
+sub get_group_indices ($ndx_file) {
+# purpose is to take the below table, and return an array, where Nr. is the index for "Group"
+#Contents of index file cpx.ndx
+#--------------------------------------------------
+#Nr.   Group               #Entries   First    Last
+#   0  System                 56416       1   56416
+#   1  Protein                 1136       1    1136
+#   2  Receptor                 965       1     965
+#   3  Ligand_CA                 10     970    1127
+#   4  Ligand                   171     966    1136
+#   5  BindingSite_CA            15      58     679
+#   6  BindingSite              206      56     700
+#   7  Receptor-BindingSite     640       1     965
+#   8  BindingAxisAnchor         30     283     702
+#and returns
+#    [0] "System",
+#    [1] "Protein",
+#    [2] "Receptor",
+#    [3] "Ligand_CA",
+#    [4] "Ligand",
+#    [5] "BindingSite_CA",
+#    [6] "BindingSite",
+#    [7] "Receptor-BindingSite",
+#    [8] "BindingAxisAnchor"
+	my $t = task({
+		cmd           => "gmx check -n $ndx_file",
+		'input.files' => $ndx_file,
+		note          => 'read ndx file'
+	});
+	my @ndx = split /\n/, $t->{stdout};
+	my $i = first_index {/^\h+\d+\h/} @ndx;
+	splice @ndx, 0, $i;
+	my @i2group;
+	foreach my $line (@ndx) {
+		my @line = grep {$_ =~ m/\H/} split /\h+/, $line, 4;
+		push @i2group, $line[1];
+	}
+	p @i2group, show_memsize => 1;
+	return \@i2group;
 }
 1;
