@@ -12,7 +12,15 @@ use Devel::Confess 'color';
 use Cwd 'getcwd';
 use Exporter qw(import);
 #use Term::ANSIColor;
-our @EXPORT = qw(gromacs_log2hash plot_gromacs_energy make_rmsd_json get_group_indices);
+our @EXPORT = qw(
+dssp
+gromacs_log2hash
+make_rmsd_json
+get_group_indices
+group_interaction_energy
+pdb_coord
+plot_gromacs_energy
+);
 our @EXPORT_OK = @EXPORT;
 use JSON 'encode_json';
 use Matplotlib::Simple;
@@ -282,16 +290,19 @@ sub get_group_indices ($ndx_file) {
 #   6  BindingSite              206      56     700
 #   7  Receptor-BindingSite     640       1     965
 #   8  BindingAxisAnchor         30     283     702
-#and returns
-#    [0] "System",
-#    [1] "Protein",
-#    [2] "Receptor",
-#    [3] "Ligand_CA",
-#    [4] "Ligand",
-#    [5] "BindingSite_CA",
-#    [6] "BindingSite",
-#    [7] "Receptor-BindingSite",
-#    [8] "BindingAxisAnchor"
+#----------
+# returns a hash
+#----------
+# BindingAxisAnchor      8,
+# BindingSite            6,
+# BindingSite_CA         5,
+# Ligand                 4,
+# Ligand_CA              3,
+# Protein                1,
+# Receptor               2,
+# Receptor-BindingSite   7,
+# System                 0
+
 	my $t = task({
 		cmd           => "gmx check -n $ndx_file",
 		'input.files' => $ndx_file,
@@ -300,12 +311,125 @@ sub get_group_indices ($ndx_file) {
 	my @ndx = split /\n/, $t->{stdout};
 	my $i = first_index {/^\h+\d+\h/} @ndx;
 	splice @ndx, 0, $i;
-	my @i2group;
+	my %group2i;
 	foreach my $line (@ndx) {
 		my @line = grep {$_ =~ m/\H/} split /\h+/, $line, 4;
-		push @i2group, $line[1];
+		$group2i{$line[1]} = $line[0];
 	}
-	p @i2group, show_memsize => 1;
-	return \@i2group;
+	return \%group2i;
+}
+
+sub group_interaction_energy ($in_xtc, $out_xtc) {
+# this removes the non-Protein elements to get energy between protein and ligand/peptide in MD run
+	return 1 if ((-f $out_xtc) && (-s $out_xtc > 9));
+	my $progro = '2eq_out.noSOL.gro';
+	task({ # group 1 = "Protein"
+		cmd            => "echo 1 | gmx trjconv -f 2eq_out.gro -s 2eq_out.gro -o $progro -n cpx.ndx",
+		'input.files'  => ['cpx.ndx', '2eq_out.gro'],
+		'output.files' => $progro,
+		overwrite      => 0
+	});
+	my $noSOL_top = 'cpx.noSOL.top';
+	unless (-f $noSOL_top) {
+		open my $in, '<', 'cpx.top';
+		open my $out, '>', $noSOL_top;
+		while (<$in>) {
+			next if /^(?:SOL|NA|CL)\h/;
+			next if /^Ion_chain/;
+			print $out $_;
+		}
+	}
+	my $mdp = '3md.rerun.mdp';
+	unless (-f $mdp) {
+		open my $fh, '>', $mdp;
+		say $fh 'energygrps = Receptor Ligand';
+	}
+	my $tpr = '3md.rerun.tpr';
+	task({
+		cmd            => "gmx grompp -f $mdp -c $progro -p $noSOL_top -n cpx.ndx -o $tpr",
+		'input.files'  => [$progro, $noSOL_top, 'cpx.ndx'],
+		'output.files' => $tpr,
+		overwrite      => 0
+	});
+	my $stem = $out_xtc;
+	$stem =~ s/\.xtc$//;
+	task({
+		'input.files' => [$tpr, $in_xtc],
+		cmd           => "gmx mdrun -s $tpr -rerun $in_xtc -e $stem.edr -nb cpu -deffnm $stem",
+		'output.files'=> "$stem.log"
+	});
+	return 1;
+}
+sub dssp ($xtc_files, $pdb_files, $json_files) { # get secondary structure prediction
+# Ligand.pdb is made thus: echo 4 | gmx editconf -f cpx.pdb -n cpx.ndx -o Ligand.pdb
+	my $n_xtc  = scalar @{ $xtc_files };
+	my $n_pdb  = scalar @{ $pdb_files };
+	my $n_json = scalar @{ $json_files };
+	unless ($n_xtc == $n_pdb == $n_json) {
+		die "There are $n_xtc xtc, $n_pdb PDB, and $n_json JSON files.  The list sizes must all be equal";
+	}
+	my @not_files = grep {not -f -r $_} @{ $xtc_files }, @{ $pdb_files };
+	if (scalar @not_files > 0) {
+		p @not_files;
+		die 'the above files are not files';
+	}
+	my @c = caller;
+	my $py = File::Temp->new(DIR => '/tmp', SUFFIX => '.py', UNLINK => 1);
+	say $py 'import mdtraj as md';
+	say $py 'import json';
+	say $py 'def ref_to_json_file(data, filename):';
+	say $py '	json1=json.dumps(data)';
+	say $py '	f = open(filename,"w+")';
+	say $py '	print(json1,file=f)';
+	foreach my ($idx, $xtc) (indexed @{ $xtc_files }) {
+		say $py "traj = md.load('$xtc', top = '$pdb_files->[$idx]')";
+		say $py 'dssp = md.compute_dssp(traj, simplified = False)';
+		say $py 'dssp = dssp.transpose()';
+		say $py 'dssp = dssp.tolist()'; # can't export to JSON otherwise
+		say $py "ref_to_json_file(dssp, '$json_files->[$idx]')";
+	}
+	close $py;
+	task({
+		cmd            => 'python ' . $py->filename,
+		'input.files'  => $xtc_files,
+		note           => "extracting DSSP from XTC files from $c[1] line $c[2]",
+		'output.files' => $json_files,
+		overwrite      => 1
+	});
+}
+sub pdb_coord ($line) {
+# https://www.cgl.ucsf.edu/chimera/docs/UsersGuide/tutorials/pdbintro.html#note5
+	my %r;
+	if ($line =~ m/^(ATOM|HETATM|TER)/) {
+		$r{'Record Type'} = $1;
+	} else {
+		die "$line isn't defined";
+	}
+	chomp $line;
+	my @line = split '', $line;
+	if ($r{'Record Type'} =~ m/^(?:ATOM|HETATM)$/) {
+		$r{'Atom serial number'}           = join ('', grep {/\d/} @line[6..10]);
+		$r{'Atom name'}                    = join ('', grep {/\H/} @line[12..15]);
+		$r{'Alternate location indicator'} = $line[16];
+		$r{'Residue name'}                 = join ('', grep {/\H/} @line[17..19]);
+		$r{'Chain identifier'}             = $line[21];
+		$r{'Residue sequence number'}      = join ('', grep {/\d/} @line[22..25]);
+		$r{'Code for insertions of residues'} = $line[26];
+		$r{'X orthogonal Å coordinate'}    = join ('', grep {/\H/} @line[30..37]);
+		$r{'Y orthogonal Å coordinate'}    = join ('', grep {/\H/} @line[38..45]);
+		$r{'Z orthogonal Å coordinate'}    = join ('', grep {/\H/} @line[46..53]);
+		$r{'Occupancy'}                    = join ('', grep {/\H/} @line[54..59]);
+		$r{'Temperature factor'}           = join ('', grep {/\H/} @line[60..65]);
+		$r{'Segment identifier'}           = join ('', grep {/\H/} @line[72..75]);
+		$r{'Element symbol'}               = join ('', grep {/\H/} @line[76..77]);
+		$r{'Charge'}                       = join ('', grep {/\H/} @line[78..79]);
+	} elsif ($r{'Record Type'} eq 'TER') {
+		$r{'Serial Number'} = join ('', grep {/\d/} @line[6..10]);
+		$r{'Residue Name'}  = join ('', grep {/\H/} @line[17..19]);
+		$r{'Chain identifier'} = $line[21];
+		$r{'Residue sequence number'} = join ('', grep {/\d/} @line[22..25]);
+		$r{'Code for insertions of residues'} = $line[26];
+	}
+	return \%r;
 }
 1;
